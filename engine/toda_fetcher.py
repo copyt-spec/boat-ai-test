@@ -1,11 +1,19 @@
 # engine/toda_fetcher.py
 # 戸田（jcd=02）出走表：BOATRACE racelist を requests + BS4 で取得（table#2 / tbody分割対応）
 #
+# 改善点:
+# - Session 再利用で高速化
+# - 1R単位 / 12R単位のメモリキャッシュ
+# - 軽いリトライ
+# - 既存の解析ロジックは維持
+#
 # ログから確定した仕様：
 # - “正しい出走表” は table#2（スコア最大）
 # - 1レース分が tbody#1..#6 に分割され、各tbodyの tr#01 が選手情報
 # - 枠番号が全角（１〜６）で入っていることがある -> 全角対応必須
 # - 余計なtr（隊列/展示ST等）は tr#02以降にあるので無視できる
+
+from __future__ import annotations
 
 import re
 import time
@@ -13,6 +21,8 @@ from typing import List, Dict, Any, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup, Tag
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 JCD_TODA = 2
 
@@ -26,7 +36,20 @@ RE_GRADE = re.compile(r"\b([A-Z]\d|B\d)\b")
 RE_RACER_GRADE = re.compile(r"(\d{4})\s*/\s*([A-Z]\d|B\d)")
 
 # 全角数字 -> 半角
-ZEN2HAN = str.maketrans({"１":"1","２":"2","３":"3","４":"4","５":"5","６":"6"})
+ZEN2HAN = str.maketrans({"１": "1", "２": "2", "３": "3", "４": "4", "５": "5", "６": "6"})
+
+# =========================
+# cache
+# =========================
+_RACE_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+_ALL_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+
+# 出走表は短時間キャッシュで十分
+_CACHE_SECONDS_RACE = 60
+_CACHE_SECONDS_ALL = 60
+
+# 共有session
+_SESSION: Optional[requests.Session] = None
 
 
 def _clean(s: str) -> str:
@@ -43,6 +66,7 @@ def _format_fl(text: str) -> str:
     Lは L0は表示しない（L1以上のみ）
     """
     parts = []
+
     mf = re.search(r"\bF(\d+)\b", text)
     if mf:
         parts.append(f"F{mf.group(1)}")
@@ -62,13 +86,14 @@ def _extract_lane_from_text(text: str) -> Optional[int]:
     例: '１ 3860 / B1 ...' -> 1
     """
     t = _normalize_digits(_clean(text))
-    # 先頭 or 先頭近くの 1..6
+
     m = re.search(r"(^| )([1-6])( |$)", t)
     if m:
         return int(m.group(2))
-    # どうしても詰まってたら先頭文字
+
     if t and t[0] in "123456":
         return int(t[0])
+
     return None
 
 
@@ -114,7 +139,7 @@ def _parse_entry_line(text: str) -> Optional[Dict[str, Any]]:
 
     name_branch = "-"
     if name != "-" or branch != "-":
-        name_branch = _clean(f"{'' if name=='-' else name} {'' if branch=='-' else branch}")
+        name_branch = _clean(f"{'' if name == '-' else name} {'' if branch == '-' else branch}")
 
     fl = _format_fl(t)
 
@@ -184,19 +209,72 @@ def _select_best_table(soup: BeautifulSoup) -> Optional[Tag]:
     tables = soup.find_all("table")
     if not tables:
         return None
+
     best = None
     best_key = (-1, -1, -1)
+
     for t in tables:
         key = _table_score(t)
         if key > best_key:
             best_key = key
             best = t
+
     return best
 
 
+def _get_cache(cache: Dict[str, Tuple[float, List[Dict[str, Any]]]], key: str, ttl: int) -> Optional[List[Dict[str, Any]]]:
+    item = cache.get(key)
+    if not item:
+        return None
+
+    ts, data = item
+    if time.time() - ts > ttl:
+        cache.pop(key, None)
+        return None
+
+    return data
+
+
+def _set_cache(cache: Dict[str, Tuple[float, List[Dict[str, Any]]]], key: str, value: List[Dict[str, Any]]) -> None:
+    cache[key] = (time.time(), value)
+
+
+def _create_session() -> requests.Session:
+    session = requests.Session()
+
+    retry = Retry(
+        total=2,
+        read=2,
+        connect=2,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(UA)
+    return session
+
+
+def _get_session() -> requests.Session:
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = _create_session()
+    return _SESSION
+
+
 def fetch_toda_racelist(race_no: int, date: str) -> List[Dict[str, Any]]:
+    cache_key = f"toda_racelist_{date}_{race_no}"
+    cached = _get_cache(_RACE_CACHE, cache_key, _CACHE_SECONDS_RACE)
+    if cached is not None:
+        return cached
+
     url = f"https://www.boatrace.jp/owpc/pc/race/racelist?hd={date}&jcd={JCD_TODA:02d}&rno={race_no}"
-    r = requests.get(url, headers=UA, timeout=20)
+
+    session = _get_session()
+    r = session.get(url, timeout=(5, 15))
     r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "html.parser")
@@ -213,13 +291,16 @@ def fetch_toda_racelist(race_no: int, date: str) -> List[Dict[str, Any]]:
             trs = tbody.find_all("tr")
             if not trs:
                 continue
+
             first_tr = trs[0]  # tr#01だけ使う
             e = _parse_entry_line(first_tr.get_text(" "))
             if not e:
                 continue
+
             lane = int(e["lane"])
             if 1 <= lane <= 6 and lane not in best_by_lane:
                 best_by_lane[lane] = e
+
             if len(best_by_lane) == 6:
                 break
     else:
@@ -228,9 +309,11 @@ def fetch_toda_racelist(race_no: int, date: str) -> List[Dict[str, Any]]:
             e = _parse_entry_line(tr.get_text(" "))
             if not e:
                 continue
+
             lane = int(e["lane"])
             if lane not in best_by_lane:
                 best_by_lane[lane] = e
+
             if len(best_by_lane) == 6:
                 break
 
@@ -242,15 +325,34 @@ def fetch_toda_racelist(race_no: int, date: str) -> List[Dict[str, Any]]:
             entries.append(row)
 
     entries.sort(key=lambda x: x["lane"])
+
+    _set_cache(_RACE_CACHE, cache_key, entries)
     return entries
 
 
-def fetch_all_toda_entries_once(date: str, sleep_sec: float = 0.15) -> List[Dict[str, Any]]:
+def fetch_all_toda_entries_once(date: str, sleep_sec: float = 0.03) -> List[Dict[str, Any]]:
+    """
+    戸田12R分をまとめて取得
+    - 12R全体もキャッシュ
+    - 1Rごとの結果もキャッシュ
+    """
+    cache_key = f"toda_all_entries_{date}"
+    cached = _get_cache(_ALL_CACHE, cache_key, _CACHE_SECONDS_ALL)
+    if cached is not None:
+        return cached
+
     all_entries: List[Dict[str, Any]] = []
+
     for rno in range(1, 13):
         try:
-            all_entries.extend(fetch_toda_racelist(rno, date))
+            rows = fetch_toda_racelist(rno, date)
+            all_entries.extend(rows)
         except Exception:
             pass
-        time.sleep(sleep_sec)
+
+        # 連打しすぎ回避。既存よりかなり短くして速度改善
+        if sleep_sec > 0:
+            time.sleep(sleep_sec)
+
+    _set_cache(_ALL_CACHE, cache_key, all_entries)
     return all_entries
