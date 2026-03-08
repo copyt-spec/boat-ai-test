@@ -1,13 +1,13 @@
-# app/main.py（FULL）
+# app/main.py
 from __future__ import annotations
 
 import traceback
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from datetime import datetime
-from zoneinfo import ZoneInfo
 from flask import Flask, render_template, request
 
 # ====== Controller ======
@@ -19,7 +19,7 @@ except Exception:
     except Exception:
         RaceController = None  # type: ignore
 
-# ====== preinfo_fetcher（任意：あるなら使う）=====
+# ====== optional preinfo fetcher ======
 try:
     from engine.preinfo_fetcher import fetch_racelist_preinfo_and_exhibit  # type: ignore
 except Exception:
@@ -29,7 +29,6 @@ except Exception:
 FEATURE_BUILDER_FUNCS = []
 try:
     from engine.trifecta_feature_builder import build_trifecta_features  # type: ignore
-
     FEATURE_BUILDER_FUNCS.append(("builder_v1", build_trifecta_features))
 except Exception as e:
     print("[WARN] cannot import engine.trifecta_feature_builder.build_trifecta_features:", e)
@@ -51,7 +50,36 @@ except Exception:
 # ====== Flask ======
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
-VENUE_CODE_MAP: Dict[str, int] = {"丸亀": 15, "戸田": 2}
+VENUE_CODE_MAP: Dict[str, int] = {
+    "丸亀": 15,
+    "戸田": 2,
+}
+
+
+# =========================
+# light in-memory cache
+# =========================
+_PAGE_CACHE: Dict[str, Tuple[float, Any]] = {}
+_PAGE_CACHE_SECONDS = 30
+
+
+def _cache_get(key: str) -> Any:
+    import time
+
+    item = _PAGE_CACHE.get(key)
+    if not item:
+        return None
+    ts, value = item
+    if time.time() - ts > _PAGE_CACHE_SECONDS:
+        _PAGE_CACHE.pop(key, None)
+        return None
+    return value
+
+
+def _cache_set(key: str, value: Any) -> None:
+    import time
+
+    _PAGE_CACHE[key] = (time.time(), value)
 
 
 # ====== Utils ======
@@ -82,8 +110,12 @@ def _is_debug_request() -> bool:
     return request.args.get("debug", "").strip() in ("1", "true", "True", "yes", "on")
 
 
+def _today_yyyymmdd_tokyo() -> str:
+    return datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y%m%d")
+
+
 def _get_date_default() -> str:
-    return request.args.get("date", "").strip() or "20260302"
+    return request.args.get("date", "").strip() or _today_yyyymmdd_tokyo()
 
 
 def _flatten_grouped_odds(grouped_odds: Any) -> Dict[str, float]:
@@ -141,8 +173,6 @@ def _calc_ev_cutoffs(ev_result: Dict[str, float]) -> Tuple[Optional[float], Opti
 def _normalize_beforeinfo_dict(beforeinfo_raw: Any) -> Dict[str, Any]:
     """
     controller.get_beforeinfo_only* が返す形式の揺れ吸収
-    - dict ならそのまま
-    - obj なら必要そうな属性だけ dict 化
     """
     if not beforeinfo_raw:
         return {}
@@ -159,7 +189,40 @@ def _normalize_beforeinfo_dict(beforeinfo_raw: Any) -> Dict[str, Any]:
         if isinstance(lanes, dict):
             for ln, v in lanes.items():
                 out[ln] = v
+
     return out
+
+
+def _pre_info_from_beforeinfo(beforeinfo: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    beforeinfo の top-level から template用 pre_info を作る
+    """
+    if not beforeinfo:
+        return {
+            "weather": "",
+            "wind_dir": "",
+            "wind_direction": "",
+            "wind_speed": 0.0,
+            "wind_speed_mps": 0.0,
+            "wave_cm": 0.0,
+        }
+
+    wind_dir = str(beforeinfo.get("wind_dir") or beforeinfo.get("wind_direction") or "").strip()
+    wind_speed = _safe_float(
+        beforeinfo.get("wind_speed_mps", beforeinfo.get("wind_speed", 0.0)),
+        0.0,
+    )
+    wave_cm = _safe_float(beforeinfo.get("wave_cm", beforeinfo.get("wave", 0.0)), 0.0)
+    weather = str(beforeinfo.get("weather") or "").strip()
+
+    return {
+        "weather": weather,
+        "wind_dir": wind_dir,
+        "wind_direction": wind_dir,
+        "wind_speed": wind_speed,
+        "wind_speed_mps": wind_speed,
+        "wave_cm": wave_cm,
+    }
 
 
 def _inject_exhibit_and_st_from_beforeinfo(entries: List[Dict[str, Any]], beforeinfo: Dict[str, Any]) -> None:
@@ -192,7 +255,41 @@ def _inject_exhibit_and_st_from_beforeinfo(entries: List[Dict[str, Any]], before
         if course is None:
             course = info.get("course_no")
 
-        # entries 側のキーはテンプレ/UIに合わせる（既存維持）
+        if e.get("exhibit") in (None, "", 0, "0") and ex not in (None, "", 0, "0"):
+            e["exhibit"] = ex
+        if e.get("start_timing") in (None, "", 0, "0") and st not in (None, "", 0, "0"):
+            e["start_timing"] = st
+        if e.get("course") in (None, "", 0, "0") and course not in (None, "", 0, "0"):
+            e["course"] = course
+
+
+def _inject_preinfo_lane_map(entries: List[Dict[str, Any]], lane_map: Dict[Any, Any]) -> None:
+    """
+    fetch_racelist_preinfo_and_exhibit の lane_map から exhibit/start_timing/course を補完
+    """
+    if not entries or not lane_map:
+        return
+
+    for e in entries:
+        lane = _to_int(e.get("lane", 0), 0)
+        if lane <= 0:
+            continue
+
+        info = lane_map.get(lane)
+        if info is None:
+            info = lane_map.get(str(lane))
+        if not info:
+            continue
+
+        if isinstance(info, dict):
+            ex = info.get("exhibit") or info.get("exhibit_time")
+            st = info.get("start_timing") or info.get("st")
+            course = info.get("course")
+        else:
+            ex = getattr(info, "exhibit", None) or getattr(info, "exhibit_time", None)
+            st = getattr(info, "start_timing", None) or getattr(info, "st", None)
+            course = getattr(info, "course", None)
+
         if e.get("exhibit") in (None, "", 0, "0") and ex not in (None, "", 0, "0"):
             e["exhibit"] = ex
         if e.get("start_timing") in (None, "", 0, "0") and st not in (None, "", 0, "0"):
@@ -208,7 +305,6 @@ def _build_features_120(
     entries: List[Dict[str, Any]],
     beforeinfo: Optional[Dict[str, Any]] = None,
 ) -> pd.DataFrame:
-    # 最優先：あなたの builder
     for name, fn in FEATURE_BUILDER_FUNCS:
         try:
             df = fn(  # type: ignore
@@ -225,7 +321,6 @@ def _build_features_120(
         except Exception as e:
             print("[WARN] feature builder failed:", name, e)
 
-    # フォールバック（UIが落ちない用）
     combos = []
     for a in range(1, 7):
         for b in range(1, 7):
@@ -254,9 +349,6 @@ def _build_features_120(
 
 
 def _uniform_probs_from_features(features_120: pd.DataFrame) -> Dict[str, float]:
-    """
-    AI失敗時も「オッズに寄らない」ためのフォールバック（完全均等）
-    """
     if not isinstance(features_120, pd.DataFrame) or "combo" not in features_120.columns:
         return {}
     combos = [str(x) for x in features_120["combo"].values]
@@ -312,11 +404,9 @@ def _calc_ai_outputs(
     features_120 = _safe_numeric_features(features_120)
     out["features_120"] = features_120
 
-    # AI無しでもUI維持
     if (not AI_ENABLED) or (BoatRaceModel is None):
         out["ai_error"] = "[AI_DISABLED]"
         out["probabilities"] = _uniform_probs_from_features(features_120)
-        # EVは odds があればだけ作る（確率には影響しない）
         if odds_map:
             out["ev_result"] = {
                 k: _safe_float(odds_map.get(k, 0.0), 0.0) * _safe_float(p, 0.0)
@@ -326,7 +416,6 @@ def _calc_ai_outputs(
         return out
 
     try:
-        # model_loader.py の __init__ に存在する引数だけ渡す（ここが大事）
         br_model = BoatRaceModel(
             temperature=_safe_float(request.args.get("temp", 1.8), 1.8),
             output_tau=_safe_float(request.args.get("tau", 1.15), 1.15),
@@ -335,11 +424,9 @@ def _calc_ai_outputs(
             debug=_is_debug_request(),
         )
 
-        # ★確率はAI出力のみ（オッズブレンド完全OFF）
-        probabilities = br_model.predict_proba(features_120)  # combo->p
+        probabilities = br_model.predict_proba(features_120)
         probabilities = dict(probabilities) if probabilities else {}
 
-        # 念のため正規化
         s = float(sum(_safe_float(v, 0.0) for v in probabilities.values()))
         if s > 0:
             probabilities = {k: _safe_float(v, 0.0) / s for k, v in probabilities.items()}
@@ -351,7 +438,6 @@ def _calc_ai_outputs(
         if _is_debug_request():
             _debug_print_top10(probabilities)
 
-        # EV（EV計算には odds を使う：これは「確率」には影響しない）
         ev_result: Dict[str, float] = {}
         if odds_map:
             if calculate_ev is not None:
@@ -379,13 +465,11 @@ def _calc_ai_outputs(
         print(out["ai_error"])
         print(traceback.format_exc())
 
-        # ★AI失敗でも「オッズ由来にはしない」：均等確率で逃がす
         out["probabilities"] = _uniform_probs_from_features(features_120)
 
         if _is_debug_request():
             _debug_print_top10(out["probabilities"])
 
-        # EVは odds がある時だけ
         if odds_map:
             out["ev_result"] = {
                 k: _safe_float(odds_map.get(k, 0.0), 0.0) * _safe_float(p, 0.0)
@@ -411,6 +495,21 @@ def _group_entries_by_race(all_entries: List[Dict[str, Any]]) -> List[Dict[str, 
     return races
 
 
+def _get_all_entries_cached(controller: RaceController, venue_name: str, date: str) -> List[Dict[str, Any]]:
+    key = f"all_entries_{venue_name}_{date}"
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+
+    if venue_name == "戸田" and hasattr(controller, "get_all_entries_toda"):
+        rows = controller.get_all_entries_toda(date)
+    else:
+        rows = controller.get_all_entries(date)
+
+    _cache_set(key, rows)
+    return rows
+
+
 def _render_venue_page(venue_name: str):
     date = _get_date_default()
     race_str = request.args.get("race", "").strip()
@@ -422,12 +521,8 @@ def _render_venue_page(venue_name: str):
     controller = RaceController()
     venue_code = VENUE_CODE_MAP.get(venue_name, 0)
 
-    # 会場ごとの出走表
     try:
-        if venue_name == "戸田" and hasattr(controller, "get_all_entries_toda"):
-            all_entries = controller.get_all_entries_toda(date)
-        else:
-            all_entries = controller.get_all_entries(date)
+        all_entries = _get_all_entries_cached(controller, venue_name, date)
     except Exception as e:
         return f"get_all_entries failed: {e}", 500
 
@@ -440,7 +535,14 @@ def _render_venue_page(venue_name: str):
     ev_cutoff_95 = None
     selected_race = 0
 
-    pre_info: Dict[str, Any] = {"weather": "", "wind_dir": "", "wind_speed": 0.0, "wave_cm": 0.0}
+    pre_info: Dict[str, Any] = {
+        "weather": "",
+        "wind_dir": "",
+        "wind_direction": "",
+        "wind_speed": 0.0,
+        "wind_speed_mps": 0.0,
+        "wave_cm": 0.0,
+    }
     beforeinfo_for_template: Dict[str, Any] = {}
     beforeinfo_for_builder: Dict[str, Any] = {}
 
@@ -449,6 +551,7 @@ def _render_venue_page(venue_name: str):
         selected_race = race_no
 
         entries = next((r["entries"] for r in races if int(r["race_no"]) == race_no), [])
+        entries = [dict(x) for x in entries]
 
         # motor/boat 補完
         try:
@@ -460,7 +563,7 @@ def _render_venue_page(venue_name: str):
             if _is_debug_request():
                 print("[ENRICH_ERROR]", e)
 
-        # 直前情報（展示/ST/気象など）
+        # 直前情報（これを最優先）
         try:
             if venue_name == "戸田" and hasattr(controller, "get_beforeinfo_only_toda"):
                 bi_raw = controller.get_beforeinfo_only_toda(race_no=race_no, date=date)
@@ -476,11 +579,20 @@ def _render_venue_page(venue_name: str):
 
         _inject_exhibit_and_st_from_beforeinfo(entries, beforeinfo_for_template)
         beforeinfo_for_builder = beforeinfo_for_template
+        pre_info = _pre_info_from_beforeinfo(beforeinfo_for_template)
 
-        # preinfo_fetcher（任意：タイムアウトしても致命傷にしない）
-        if fetch_racelist_preinfo_and_exhibit is not None and venue_code:
+        # 補助 fetcher は「不足時だけ」
+        need_preinfo_fallback = False
+        if not pre_info.get("weather"):
+            need_preinfo_fallback = True
+        if not pre_info.get("wind_dir"):
+            need_preinfo_fallback = True
+        if all((e.get("exhibit") in (None, "", 0, "0")) for e in entries):
+            need_preinfo_fallback = True
+
+        if need_preinfo_fallback and fetch_racelist_preinfo_and_exhibit is not None and venue_code:
             try:
-                pre, _lane_map = fetch_racelist_preinfo_and_exhibit(  # type: ignore
+                pre, lane_map = fetch_racelist_preinfo_and_exhibit(  # type: ignore
                     venue_code=venue_code,
                     date=date,
                     race_no=race_no,
@@ -499,20 +611,25 @@ def _render_venue_page(venue_name: str):
                 )
                 wave_cm = _safe_float(_get_pre("wave_cm", _get_pre("wave", 0.0)), 0.0)
 
-                pre_info = {
-                    "weather": weather,
-                    "wind_dir": wind_dir,
-                    "wind_direction": wind_dir,
-                    "wind_speed": wind_speed_mps,
-                    "wind_speed_mps": wind_speed_mps,
-                    "wave_cm": wave_cm,
-                }
+                if weather:
+                    pre_info["weather"] = weather
+                if wind_dir:
+                    pre_info["wind_dir"] = wind_dir
+                    pre_info["wind_direction"] = wind_dir
+                if wind_speed_mps > 0:
+                    pre_info["wind_speed"] = wind_speed_mps
+                    pre_info["wind_speed_mps"] = wind_speed_mps
+                if wave_cm > 0:
+                    pre_info["wave_cm"] = wave_cm
+
+                if lane_map:
+                    _inject_preinfo_lane_map(entries, lane_map)
 
             except Exception as e:
                 if _is_debug_request():
                     print("[PREINFO_FETCHER_ERROR]", e)
 
-        # odds（押下時のみ）
+        # odds（詳細時のみ）
         try:
             if venue_name == "戸田" and hasattr(controller, "get_odds_only_toda"):
                 grouped_odds = controller.get_odds_only_toda(race_no=race_no, date=date)
@@ -533,7 +650,6 @@ def _render_venue_page(venue_name: str):
             if _is_debug_request():
                 print("[ODDS_ERROR]", e)
 
-        # ★AI：oddsが無くても確率だけは出す（EVは空）
         ai = _calc_ai_outputs(
             venue_name=venue_name,
             date=date,
@@ -549,7 +665,6 @@ def _render_venue_page(venue_name: str):
         ev_cutoff_95 = ai.get("ev_cutoff_95")
         pre_info = ai.get("pre_info") or pre_info
 
-        # racesのentries差し替え
         for r in races:
             if int(r.get("race_no", 0)) == race_no:
                 r["entries"] = entries
@@ -570,15 +685,12 @@ def _render_venue_page(venue_name: str):
         beforeinfo=beforeinfo_for_template,
     )
 
-def _today_yyyymmdd_tokyo() -> str:
-    return datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y%m%d")
-
 
 @app.route("/")
 def home():
-    # ?date=YYYYMMDD が来ていればそれを使う。なければ今日
     date = request.args.get("date", "").strip() or _today_yyyymmdd_tokyo()
     return render_template("home.html", date=date)
+
 
 @app.route("/marugame")
 def marugame():
