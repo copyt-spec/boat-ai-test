@@ -25,6 +25,13 @@ try:
 except Exception:
     fetch_racelist_preinfo_and_exhibit = None  # type: ignore
 
+# ====== Racer stats loader ======
+try:
+    from engine.racer_stats_loader import enrich_entries_with_racer_stats  # type: ignore
+except Exception as e:
+    enrich_entries_with_racer_stats = None  # type: ignore
+    print("[WARN] cannot import engine.racer_stats_loader.enrich_entries_with_racer_stats:", e)
+
 # ====== Feature Builder ======
 FEATURE_BUILDER_FUNCS = []
 try:
@@ -54,7 +61,6 @@ VENUE_CODE_MAP: Dict[str, int] = {
     "丸亀": 15,
     "戸田": 2,
 }
-
 
 # =========================
 # light in-memory cache
@@ -194,9 +200,6 @@ def _normalize_beforeinfo_dict(beforeinfo_raw: Any) -> Dict[str, Any]:
 
 
 def _pre_info_from_beforeinfo(beforeinfo: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    beforeinfo の top-level から template用 pre_info を作る
-    """
     if not beforeinfo:
         return {
             "weather": "",
@@ -226,9 +229,6 @@ def _pre_info_from_beforeinfo(beforeinfo: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _inject_exhibit_and_st_from_beforeinfo(entries: List[Dict[str, Any]], beforeinfo: Dict[str, Any]) -> None:
-    """
-    出走表 entries に、直前情報(展示/ST/進入)があれば埋める
-    """
     if not entries or not beforeinfo:
         return
 
@@ -264,9 +264,6 @@ def _inject_exhibit_and_st_from_beforeinfo(entries: List[Dict[str, Any]], before
 
 
 def _inject_preinfo_lane_map(entries: List[Dict[str, Any]], lane_map: Dict[Any, Any]) -> None:
-    """
-    fetch_racelist_preinfo_and_exhibit の lane_map から exhibit/start_timing/course を補完
-    """
     if not entries or not lane_map:
         return
 
@@ -510,6 +507,17 @@ def _get_all_entries_cached(controller: RaceController, venue_name: str, date: s
     return rows
 
 
+def _enrich_entries_with_racer_stats_safe(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if enrich_entries_with_racer_stats is None:
+        return entries
+    try:
+        return enrich_entries_with_racer_stats(entries)
+    except Exception as e:
+        if _is_debug_request():
+            print("[RACER_STATS_ENRICH_ERROR]", e)
+        return entries
+
+
 def _render_venue_page(venue_name: str):
     date = _get_date_default()
     race_str = request.args.get("race", "").strip()
@@ -553,6 +561,9 @@ def _render_venue_page(venue_name: str):
         entries = next((r["entries"] for r in races if int(r["race_no"]) == race_no), [])
         entries = [dict(x) for x in entries]
 
+        # 選手能力付与（先にやっておく）
+        entries = _enrich_entries_with_racer_stats_safe(entries)
+
         # motor/boat 補完
         try:
             if venue_name == "戸田" and hasattr(controller, "enrich_entries_toda"):
@@ -581,7 +592,7 @@ def _render_venue_page(venue_name: str):
         beforeinfo_for_builder = beforeinfo_for_template
         pre_info = _pre_info_from_beforeinfo(beforeinfo_for_template)
 
-        # 補助 fetcher は「不足時だけ」
+        # 補助 fetcher は不足時だけ
         need_preinfo_fallback = False
         if not pre_info.get("weather"):
             need_preinfo_fallback = True
