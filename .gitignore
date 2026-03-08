@@ -5,7 +5,6 @@ __pycache__/
 
 data/datasets/
 data/raw_txt/
-data/models/
 
 *.csv
 *.db
