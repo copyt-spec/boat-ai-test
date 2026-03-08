@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 import pandas as pd
 
 
@@ -102,44 +102,6 @@ def _bi_lane_dict(v: Any) -> Dict[str, Any]:
     return {}
 
 
-def _rank_asc(values: Dict[int, float]) -> Dict[int, float]:
-    # 小さいほど良い（展示/ST）
-    items = sorted(values.items(), key=lambda kv: (kv[1], kv[0]))
-    out: Dict[int, float] = {}
-    r = 1
-    for ln, _v in items:
-        out[ln] = float(r)
-        r += 1
-    return out
-
-
-def _rank_desc(values: Dict[int, float]) -> Dict[int, float]:
-    # 大きいほど良い（motor/boat）
-    items = sorted(values.items(), key=lambda kv: (-kv[1], kv[0]))
-    out: Dict[int, float] = {}
-    r = 1
-    for ln, _v in items:
-        out[ln] = float(r)
-        r += 1
-    return out
-
-
-def _mean_std(values: Dict[int, float]) -> Tuple[float, float]:
-    arr = [float(v) for v in values.values()]
-    if not arr:
-        return 0.0, 0.0
-    m = sum(arr) / len(arr)
-    var = sum((x - m) ** 2 for x in arr) / max(1, len(arr))
-    sd = var ** 0.5
-    return float(m), float(sd)
-
-
-def _z(v: float, m: float, sd: float) -> float:
-    if sd <= 1e-9:
-        return 0.0
-    return (v - m) / sd
-
-
 def build_trifecta_features(
     race_entries: List[Dict[str, Any]],
     before_info: Optional[Dict[str, Any]] = None,
@@ -149,40 +111,37 @@ def build_trifecta_features(
 ) -> pd.DataFrame:
     """
     1レース6艇 -> 120行（combo候補）
-    ★学習側 build_trifecta_train_features.py と列名/意味を一致させる（重要）
-    - 展示/ST/進入の “相対” 特徴量を追加（rank / mean差 / z / course_delta）
-    - オッズ由来列は混入しても drop（リーク防止）
+    学習と推論で列を合わせる前提
+
+    今回追加:
+    - racer_stats_loader 由来の能力列
+    - コース適性列
+    - 差分特徴
     """
     bi = before_info or {}
 
-    # race_entries は laneキーがある想定（motor/boat/racer_no はここから）
-    lane_entry: Dict[int, Dict[str, Any]] = {}
+    lane_map: Dict[int, Dict[str, Any]] = {}
     for e in race_entries:
         lane = int(_to_float(e.get("lane")))
-        if lane <= 0:
-            continue
-        lane_entry[lane] = e
+        if 1 <= lane <= 6:
+            lane_map[lane] = e
 
-    # beforeinfo: lane -> dict/obj（キー揺れ吸収込み）
     def _bi_lane(lane: int) -> Dict[str, Any]:
         v = bi.get(lane)
         d = _bi_lane_dict(v)
 
-        # exhibit_time
         if "exhibit_time" not in d:
             for k in ("exhibit", "ex_time", "exhibitTime"):
                 if k in d:
                     d["exhibit_time"] = d.get(k)
                     break
 
-        # st
         if "st" not in d:
             for k in ("start_timing", "start", "st_time"):
                 if k in d:
                     d["st"] = d.get(k)
                     break
 
-        # course
         if "course" not in d:
             for k in ("course_no", "cource", "courseNo"):
                 if k in d:
@@ -191,99 +150,10 @@ def build_trifecta_features(
 
         return d
 
-    # ===== 環境（beforeinfo由来。なければ0）=====
     wave_cm = _to_float(_bi_get(bi, "wave_cm", "wave", "waveCm"))
     wind_speed_mps = _to_float(_bi_get(bi, "wind_speed_mps", "wind_speed", "wind", "windSpeed", "wind_speed_ms"))
     wind_dir = _wind_dir_to_num(_bi_get(bi, "wind_dir", "wind_direction", "windDirection", "wind_dir_name"))
     weather = _weather_to_num(_bi_get(bi, "weather", "tenki", "weather_name"))
-
-    # ===== レース内の lane1..6 の数値を作る（相対化のため）=====
-    exhibit_by_lane: Dict[int, float] = {}
-    st_by_lane: Dict[int, float] = {}
-    course_by_lane: Dict[int, float] = {}
-    motor_by_lane: Dict[int, float] = {}
-    boat_by_lane: Dict[int, float] = {}
-
-    for ln in range(1, 7):
-        e = lane_entry.get(ln, {})
-        b = _bi_lane(ln)
-
-        boat_by_lane[ln] = _to_float(e.get("boat"))
-        motor_by_lane[ln] = _to_float(e.get("motor"))
-        exhibit_by_lane[ln] = _to_float(b.get("exhibit_time"))
-        st_by_lane[ln] = _to_float(b.get("st"))
-        course_by_lane[ln] = _to_float(b.get("course"))
-
-    exhibit_rank = _rank_asc(exhibit_by_lane)
-    st_rank = _rank_asc(st_by_lane)
-    motor_rank = _rank_desc(motor_by_lane)
-    boat_rank = _rank_desc(boat_by_lane)
-
-    ex_mean, ex_std = _mean_std(exhibit_by_lane)
-    st_mean, st_std = _mean_std(st_by_lane)
-    mo_mean, mo_std = _mean_std(motor_by_lane)
-    bo_mean, bo_std = _mean_std(boat_by_lane)
-    co_mean, co_std = _mean_std(course_by_lane)
-
-    race_level = {
-        "exhibit_mean": ex_mean,
-        "exhibit_std": ex_std,
-        "st_mean": st_mean,
-        "st_std": st_std,
-        "motor_mean": mo_mean,
-        "motor_std": mo_std,
-        "boat_mean": bo_mean,
-        "boat_std": bo_std,
-        "course_mean": co_mean,
-        "course_std": co_std,
-    }
-
-    def _pack(prefix: str, lane: int) -> Dict[str, Any]:
-        e = lane_entry.get(lane, {})
-        b = _bi_lane(lane)
-
-        boat_v = _to_float(e.get("boat"))
-        motor_v = _to_float(e.get("motor"))
-        racer_no_v = _to_float(e.get("racer_no"))
-
-        exhibit_v = _to_float(b.get("exhibit_time"))
-        st_v = _to_float(b.get("st"))
-        course_v = _to_float(b.get("course"))
-
-        course_delta = course_v - float(lane)
-        course_abs_delta = abs(course_delta)
-
-        return {
-            f"{prefix}_lane": float(lane),
-            f"{prefix}_boat": boat_v,
-            f"{prefix}_course": course_v,
-            f"{prefix}_exhibit": exhibit_v,
-            f"{prefix}_motor": motor_v,
-            f"{prefix}_racer_no": racer_no_v,
-            f"{prefix}_st": st_v,
-
-            # ===== 相対特徴（学習側と一致）=====
-            f"{prefix}_exhibit_rank": exhibit_rank.get(lane, 0.0),
-            f"{prefix}_st_rank": st_rank.get(lane, 0.0),
-            f"{prefix}_motor_rank": motor_rank.get(lane, 0.0),
-            f"{prefix}_boat_rank": boat_rank.get(lane, 0.0),
-
-            f"{prefix}_exhibit_diff_mean": exhibit_v - ex_mean,
-            f"{prefix}_st_diff_mean": st_v - st_mean,
-            f"{prefix}_motor_diff_mean": motor_v - mo_mean,
-            f"{prefix}_boat_diff_mean": boat_v - bo_mean,
-            f"{prefix}_course_diff_mean": course_v - co_mean,
-
-            f"{prefix}_exhibit_z": _z(exhibit_v, ex_mean, ex_std),
-            f"{prefix}_st_z": _z(st_v, st_mean, st_std),
-            f"{prefix}_motor_z": _z(motor_v, mo_mean, mo_std),
-            f"{prefix}_boat_z": _z(boat_v, bo_mean, bo_std),
-            f"{prefix}_course_z": _z(course_v, co_mean, co_std),
-
-            f"{prefix}_course_delta": course_delta,
-            f"{prefix}_course_abs_delta": course_abs_delta,
-            f"{prefix}_is_course_change": 1.0 if course_abs_delta >= 0.5 else 0.0,
-        }
 
     rows: List[Dict[str, Any]] = []
 
@@ -291,28 +161,104 @@ def build_trifecta_features(
         a_s, b_s, c_s = combo.split("-")
         a, b, c = int(a_s), int(b_s), int(c_s)
 
-        fa = _pack("a", a)
-        fb = _pack("b", b)
-        fc = _pack("c", c)
+        ea = lane_map.get(a, {})
+        eb = lane_map.get(b, {})
+        ec = lane_map.get(c, {})
 
-        feat: Dict[str, Any] = {
+        ba = _bi_lane(a)
+        bb = _bi_lane(b)
+        bc = _bi_lane(c)
+
+        feat = {
             "date": date,
             "venue": venue,
             "race_no": float(race_no),
+
             "combo": combo,
 
-            # 気象
             "wave_cm": wave_cm,
             "weather": weather,
             "wind_dir": wind_dir,
             "wind_speed_mps": wind_speed_mps,
-        }
-        feat.update(race_level)
-        feat.update(fa)
-        feat.update(fb)
-        feat.update(fc)
 
-        # ===== 既存差分（維持）=====
+            # ===== A =====
+            "a_lane": float(a),
+            "a_boat": _to_float(ea.get("boat")),
+            "a_course": _to_float(ba.get("course")),
+            "a_exhibit": _to_float(ba.get("exhibit_time")),
+            "a_motor": _to_float(ea.get("motor")),
+            "a_racer_no": _to_float(ea.get("racer_no")),
+            "a_st": _to_float(ba.get("st")),
+
+            "a_racer_win_rate": _to_float(ea.get("racer_win_rate")),
+            "a_racer_place_rate": _to_float(ea.get("racer_place_rate")),
+            "a_racer_avg_st_base": _to_float(ea.get("racer_avg_st_base")),
+            "a_racer_ability_index": _to_float(ea.get("racer_ability_index")),
+            "a_racer_prev_ability_index": _to_float(ea.get("racer_prev_ability_index")),
+            "a_racer_grade_score": _to_float(ea.get("racer_grade_score")),
+            "a_racer_prev_grade_score": _to_float(ea.get("racer_prev_grade_score")),
+            "a_racer_age": _to_float(ea.get("racer_age")),
+            "a_racer_height": _to_float(ea.get("racer_height")),
+            "a_racer_weight": _to_float(ea.get("racer_weight")),
+
+            # ===== B =====
+            "b_lane": float(b),
+            "b_boat": _to_float(eb.get("boat")),
+            "b_course": _to_float(bb.get("course")),
+            "b_exhibit": _to_float(bb.get("exhibit_time")),
+            "b_motor": _to_float(eb.get("motor")),
+            "b_racer_no": _to_float(eb.get("racer_no")),
+            "b_st": _to_float(bb.get("st")),
+
+            "b_racer_win_rate": _to_float(eb.get("racer_win_rate")),
+            "b_racer_place_rate": _to_float(eb.get("racer_place_rate")),
+            "b_racer_avg_st_base": _to_float(eb.get("racer_avg_st_base")),
+            "b_racer_ability_index": _to_float(eb.get("racer_ability_index")),
+            "b_racer_prev_ability_index": _to_float(eb.get("racer_prev_ability_index")),
+            "b_racer_grade_score": _to_float(eb.get("racer_grade_score")),
+            "b_racer_prev_grade_score": _to_float(eb.get("racer_prev_grade_score")),
+            "b_racer_age": _to_float(eb.get("racer_age")),
+            "b_racer_height": _to_float(eb.get("racer_height")),
+            "b_racer_weight": _to_float(eb.get("racer_weight")),
+
+            # ===== C =====
+            "c_lane": float(c),
+            "c_boat": _to_float(ec.get("boat")),
+            "c_course": _to_float(bc.get("course")),
+            "c_exhibit": _to_float(bc.get("exhibit_time")),
+            "c_motor": _to_float(ec.get("motor")),
+            "c_racer_no": _to_float(ec.get("racer_no")),
+            "c_st": _to_float(bc.get("st")),
+
+            "c_racer_win_rate": _to_float(ec.get("racer_win_rate")),
+            "c_racer_place_rate": _to_float(ec.get("racer_place_rate")),
+            "c_racer_avg_st_base": _to_float(ec.get("racer_avg_st_base")),
+            "c_racer_ability_index": _to_float(ec.get("racer_ability_index")),
+            "c_racer_prev_ability_index": _to_float(ec.get("racer_prev_ability_index")),
+            "c_racer_grade_score": _to_float(ec.get("racer_grade_score")),
+            "c_racer_prev_grade_score": _to_float(ec.get("racer_prev_grade_score")),
+            "c_racer_age": _to_float(ec.get("racer_age")),
+            "c_racer_height": _to_float(ec.get("racer_height")),
+            "c_racer_weight": _to_float(ec.get("racer_weight")),
+        }
+
+        # ===== コース適性（その艇が今回の枠で走る前提）=====
+        feat["a_racer_course_place_rate"] = _to_float(ea.get(f"racer_course{a}_place_rate"))
+        feat["a_racer_course_avg_st"] = _to_float(ea.get(f"racer_course{a}_avg_st"))
+        feat["a_racer_course_avg_st_rank"] = _to_float(ea.get(f"racer_course{a}_avg_st_rank"))
+        feat["a_racer_course_entry_count"] = _to_float(ea.get(f"racer_course{a}_entry_count"))
+
+        feat["b_racer_course_place_rate"] = _to_float(eb.get(f"racer_course{b}_place_rate"))
+        feat["b_racer_course_avg_st"] = _to_float(eb.get(f"racer_course{b}_avg_st"))
+        feat["b_racer_course_avg_st_rank"] = _to_float(eb.get(f"racer_course{b}_avg_st_rank"))
+        feat["b_racer_course_entry_count"] = _to_float(eb.get(f"racer_course{b}_entry_count"))
+
+        feat["c_racer_course_place_rate"] = _to_float(ec.get(f"racer_course{c}_place_rate"))
+        feat["c_racer_course_avg_st"] = _to_float(ec.get(f"racer_course{c}_avg_st"))
+        feat["c_racer_course_avg_st_rank"] = _to_float(ec.get(f"racer_course{c}_avg_st_rank"))
+        feat["c_racer_course_entry_count"] = _to_float(ec.get(f"racer_course{c}_entry_count"))
+
+        # ===== 既存差分 =====
         feat.update({
             "ab_exhibit_diff": feat["a_exhibit"] - feat["b_exhibit"],
             "ac_exhibit_diff": feat["a_exhibit"] - feat["c_exhibit"],
@@ -331,35 +277,46 @@ def build_trifecta_features(
             "bc_motor_diff": feat["b_motor"] - feat["c_motor"],
         })
 
-        # ===== 追加：相対(rank/z)の差分（学習側と一致）=====
+        # ===== 能力差分 =====
         feat.update({
-            "ab_exhibit_rank_diff": feat["a_exhibit_rank"] - feat["b_exhibit_rank"],
-            "ac_exhibit_rank_diff": feat["a_exhibit_rank"] - feat["c_exhibit_rank"],
-            "bc_exhibit_rank_diff": feat["b_exhibit_rank"] - feat["c_exhibit_rank"],
+            "ab_racer_win_rate_diff": feat["a_racer_win_rate"] - feat["b_racer_win_rate"],
+            "ac_racer_win_rate_diff": feat["a_racer_win_rate"] - feat["c_racer_win_rate"],
+            "bc_racer_win_rate_diff": feat["b_racer_win_rate"] - feat["c_racer_win_rate"],
 
-            "ab_st_rank_diff": feat["a_st_rank"] - feat["b_st_rank"],
-            "ac_st_rank_diff": feat["a_st_rank"] - feat["c_st_rank"],
-            "bc_st_rank_diff": feat["b_st_rank"] - feat["c_st_rank"],
+            "ab_racer_place_rate_diff": feat["a_racer_place_rate"] - feat["b_racer_place_rate"],
+            "ac_racer_place_rate_diff": feat["a_racer_place_rate"] - feat["c_racer_place_rate"],
+            "bc_racer_place_rate_diff": feat["b_racer_place_rate"] - feat["c_racer_place_rate"],
 
-            "ab_course_abs_delta_diff": feat["a_course_abs_delta"] - feat["b_course_abs_delta"],
-            "ac_course_abs_delta_diff": feat["a_course_abs_delta"] - feat["c_course_abs_delta"],
-            "bc_course_abs_delta_diff": feat["b_course_abs_delta"] - feat["c_course_abs_delta"],
+            "ab_racer_avg_st_base_diff": feat["a_racer_avg_st_base"] - feat["b_racer_avg_st_base"],
+            "ac_racer_avg_st_base_diff": feat["a_racer_avg_st_base"] - feat["c_racer_avg_st_base"],
+            "bc_racer_avg_st_base_diff": feat["b_racer_avg_st_base"] - feat["c_racer_avg_st_base"],
+
+            "ab_racer_ability_index_diff": feat["a_racer_ability_index"] - feat["b_racer_ability_index"],
+            "ac_racer_ability_index_diff": feat["a_racer_ability_index"] - feat["c_racer_ability_index"],
+            "bc_racer_ability_index_diff": feat["b_racer_ability_index"] - feat["c_racer_ability_index"],
+
+            "ab_racer_grade_score_diff": feat["a_racer_grade_score"] - feat["b_racer_grade_score"],
+            "ac_racer_grade_score_diff": feat["a_racer_grade_score"] - feat["c_racer_grade_score"],
+            "bc_racer_grade_score_diff": feat["b_racer_grade_score"] - feat["c_racer_grade_score"],
+
+            "ab_racer_course_place_rate_diff": feat["a_racer_course_place_rate"] - feat["b_racer_course_place_rate"],
+            "ac_racer_course_place_rate_diff": feat["a_racer_course_place_rate"] - feat["c_racer_course_place_rate"],
+            "bc_racer_course_place_rate_diff": feat["b_racer_course_place_rate"] - feat["c_racer_course_place_rate"],
+
+            "ab_racer_course_avg_st_diff": feat["a_racer_course_avg_st"] - feat["b_racer_course_avg_st"],
+            "ac_racer_course_avg_st_diff": feat["a_racer_course_avg_st"] - feat["c_racer_course_avg_st"],
+            "bc_racer_course_avg_st_diff": feat["b_racer_course_avg_st"] - feat["c_racer_course_avg_st"],
+
+            "ab_racer_course_avg_st_rank_diff": feat["a_racer_course_avg_st_rank"] - feat["b_racer_course_avg_st_rank"],
+            "ac_racer_course_avg_st_rank_diff": feat["a_racer_course_avg_st_rank"] - feat["c_racer_course_avg_st_rank"],
+            "bc_racer_course_avg_st_rank_diff": feat["b_racer_course_avg_st_rank"] - feat["c_racer_course_avg_st_rank"],
         })
 
         rows.append(feat)
 
     df = pd.DataFrame(rows)
 
-    # =========================
-    # ★オッズ由来の列が混入しても落とす（リーク防止）
-    # =========================
     if drop_odds_leakage is not None:
         df = drop_odds_leakage(df, verbose=False, context="trifecta_feature_builder")
-
-    # debug が欲しければここをON（普段はOFF推奨）
-    # if find_odds_leak_columns is not None:
-    #     bad = find_odds_leak_columns(df.columns)
-    #     if bad:
-    #         print(f"[LEAK_DETECTED] trifecta_feature_builder columns={bad}")
 
     return df
