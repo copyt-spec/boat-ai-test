@@ -1,8 +1,13 @@
 # engine/toda_fetcher.py
 from __future__ import annotations
 
+
+
+
 import re
 import time
+import warnings
+from bs4 import BeautifulSoup, Tag, XMLParsedAsHTMLWarning
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -10,6 +15,8 @@ import requests
 from bs4 import BeautifulSoup, Tag
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 JCD_TODA = 2
 
