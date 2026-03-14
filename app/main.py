@@ -254,38 +254,6 @@ def _inject_exhibit_and_st_from_beforeinfo(entries: List[Dict[str, Any]], before
             e["course"] = course
 
 
-def _inject_preinfo_lane_map(entries: List[Dict[str, Any]], lane_map: Dict[Any, Any]) -> None:
-    if not entries or not lane_map:
-        return
-
-    for e in entries:
-        lane = _to_int(e.get("lane", 0), 0)
-        if lane <= 0:
-            continue
-
-        info = lane_map.get(lane)
-        if info is None:
-            info = lane_map.get(str(lane))
-        if not info:
-            continue
-
-        if isinstance(info, dict):
-            ex = info.get("exhibit") or info.get("exhibit_time")
-            st = info.get("start_timing") or info.get("st")
-            course = info.get("course")
-        else:
-            ex = getattr(info, "exhibit", None) or getattr(info, "exhibit_time", None)
-            st = getattr(info, "start_timing", None) or getattr(info, "st", None)
-            course = getattr(info, "course", None)
-
-        if e.get("exhibit") in (None, "", 0, "0") and ex not in (None, "", 0, "0"):
-            e["exhibit"] = ex
-        if e.get("start_timing") in (None, "", 0, "0") and st not in (None, "", 0, "0"):
-            e["start_timing"] = st
-        if e.get("course") in (None, "", 0, "0") and course not in (None, "", 0, "0"):
-            e["course"] = course
-
-
 def _enrich_entries_with_racer_stats_safe(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if enrich_entries_with_racer_stats is None:
         return entries
@@ -588,9 +556,12 @@ def _render_venue_page(venue_name: str):
     races = _blank_races()
     races[race_no - 1]["entries"] = entries
 
+    # =========================================
+    # enrich: 戸田ではやらない（重い二重取得を避ける）
+    # =========================================
     try:
         if venue_name == "戸田":
-            entries = controller.enrich_entries_toda(entries, date=date, race_no=race_no)
+            pass
         else:
             entries = controller.enrich_entries_marugame(entries, date=date, race_no=race_no)
     except Exception as e:
@@ -628,52 +599,10 @@ def _render_venue_page(venue_name: str):
     beforeinfo_for_builder = beforeinfo_for_template
     pre_info = _pre_info_from_beforeinfo(beforeinfo_for_template)
 
-    need_preinfo_fallback = False
-    if not pre_info.get("weather"):
-        need_preinfo_fallback = True
-    if not pre_info.get("wind_dir"):
-        need_preinfo_fallback = True
-    if all((e.get("exhibit") in (None, "", 0, "0")) for e in entries):
-        need_preinfo_fallback = True
-
-    if need_preinfo_fallback and fetch_racelist_preinfo_and_exhibit is not None and venue_code:
-        try:
-            pre, lane_map = fetch_racelist_preinfo_and_exhibit(  # type: ignore
-                venue_code=venue_code,
-                date=date,
-                race_no=race_no,
-            )
-
-            def _get_pre(key: str, default: Any = "") -> Any:
-                if isinstance(pre, dict):
-                    return pre.get(key, default)
-                return getattr(pre, key, default)
-
-            weather = (_get_pre("weather", "") or "").strip()
-            wind_dir = (_get_pre("wind_dir", "") or _get_pre("wind_direction", "") or "").strip()
-            wind_speed_mps = _safe_float(
-                _get_pre("wind_speed_mps", _get_pre("wind_speed", _get_pre("wind_mps", 0.0))),
-                0.0,
-            )
-            wave_cm = _safe_float(_get_pre("wave_cm", _get_pre("wave", 0.0)), 0.0)
-
-            if weather:
-                pre_info["weather"] = weather
-            if wind_dir:
-                pre_info["wind_dir"] = wind_dir
-                pre_info["wind_direction"] = wind_dir
-            if wind_speed_mps > 0:
-                pre_info["wind_speed"] = wind_speed_mps
-                pre_info["wind_speed_mps"] = wind_speed_mps
-            if wave_cm > 0:
-                pre_info["wave_cm"] = wave_cm
-
-            if lane_map:
-                _inject_preinfo_lane_map(entries, lane_map)
-
-        except Exception as e:
-            if _is_debug_request():
-                print("[PREINFO_FETCHER_ERROR]", e)
+    # =========================================
+    # preinfo fallback は止める（重いので）
+    # =========================================
+    # need_preinfo_fallback = False
 
     try:
         if venue_name == "戸田":
