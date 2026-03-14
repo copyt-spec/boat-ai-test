@@ -273,7 +273,7 @@ def fetch_toda_racelist(race_no: int, date: str) -> List[Dict[str, Any]]:
     url = f"https://www.boatrace.jp/owpc/pc/race/racelist?hd={date}&jcd={JCD_TODA:02d}&rno={race_no}"
 
     session = _get_session()
-    r = session.get(url, timeout=(4, 10))
+    r = session.get(url, timeout=(5, 20))
     r.raise_for_status()
 
     soup = _make_soup(r.text)
