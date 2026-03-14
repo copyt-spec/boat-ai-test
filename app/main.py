@@ -715,14 +715,3 @@ def toda():
 
 if __name__ == "__main__":
     app.run(debug=True)
-	engine/model_bootstrap.py
-from __future__ import annotations
-
-
-
-
-def _extract_gzip(src_gz: str, dst_path: str) -> None:
-    with gzip.open(src_gz, "rb") as f_in:
-        with open(dst_path, "wb") as f_out:
-            shutil.copyfileobj(f_in, f_out)
-お願いします。Render の環境変数も入れました。場所は今までのままです。please fix and send full code.
