@@ -13,10 +13,12 @@ from flask import Flask, render_template, request
 # ====== Controller ======
 try:
     from app.controller import RaceController
-except Exception:
+except Exception as e1:
+    print("[IMPORT_ERROR] from app.controller import RaceController failed:", e1)
     try:
         from controller import RaceController  # type: ignore
-    except Exception:
+    except Exception as e2:
+        print("[IMPORT_ERROR] from controller import RaceController failed:", e2)
         RaceController = None  # type: ignore
 
 # ====== optional preinfo fetcher ======
@@ -68,6 +70,11 @@ VENUE_CODE_MAP: Dict[str, int] = {
     "戸田": 2,
 }
 
+# =========================
+# global caches
+# =========================
+_MODEL_CACHE: Dict[Tuple[float, float, float, float, bool], Any] = {}
+
 
 # =========================
 # utils
@@ -109,22 +116,6 @@ def _get_date_default() -> str:
 
 def _blank_races() -> List[Dict[str, Any]]:
     return [{"race_no": rn, "entries": []} for rn in range(1, 13)]
-
-
-def _group_entries_by_race(all_entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    by_race: Dict[int, List[Dict[str, Any]]] = {}
-    for e in all_entries or []:
-        rn = e.get("race_no")
-        try:
-            rn_i = int(rn)
-        except Exception:
-            continue
-        by_race.setdefault(rn_i, []).append(e)
-
-    races = []
-    for rn in range(1, 13):
-        races.append({"race_no": rn, "entries": by_race.get(rn, [])})
-    return races
 
 
 def _flatten_grouped_odds(grouped_odds: Any) -> Dict[str, float]:
@@ -380,6 +371,41 @@ def _debug_print_top10(probabilities: Dict[str, float]) -> None:
         print(f"  {c} {pf}")
 
 
+def _get_model_instance(
+    temperature: float,
+    output_tau: float,
+    rescue_max: float,
+    rescue_mix_cap: float,
+    debug: bool,
+):
+    global _MODEL_CACHE
+
+    key = (
+        float(temperature),
+        float(output_tau),
+        float(rescue_max),
+        float(rescue_mix_cap),
+        bool(debug),
+    )
+
+    model = _MODEL_CACHE.get(key)
+    if model is not None:
+        return model
+
+    if BoatRaceModel is None:
+        return None
+
+    model = BoatRaceModel(
+        temperature=temperature,
+        output_tau=output_tau,
+        rescue_max=rescue_max,
+        rescue_mix_cap=rescue_mix_cap,
+        debug=debug,
+    )
+    _MODEL_CACHE[key] = model
+    return model
+
+
 def _calc_ai_outputs(
     venue_name: str,
     date: str,
@@ -414,6 +440,7 @@ def _calc_ai_outputs(
 
     if (not AI_ENABLED) or (BoatRaceModel is None):
         out["ai_error"] = "[AI_DISABLED]"
+        print("[AI_DISABLED] BoatRaceModel is unavailable")
         out["probabilities"] = _uniform_probs_from_features(features_120)
         if odds_map:
             out["ev_result"] = {
@@ -424,13 +451,16 @@ def _calc_ai_outputs(
         return out
 
     try:
-        br_model = BoatRaceModel(
+        br_model = _get_model_instance(
             temperature=_safe_float(request.args.get("temp", 1.8), 1.8),
             output_tau=_safe_float(request.args.get("tau", 1.15), 1.15),
             rescue_max=_safe_float(request.args.get("rmax", 0.85), 0.85),
             rescue_mix_cap=_safe_float(request.args.get("rmix", 0.20), 0.20),
             debug=_is_debug_request(),
         )
+
+        if br_model is None:
+            raise RuntimeError("BoatRaceModel cache returned None")
 
         probabilities = br_model.predict_proba(features_120)
         probabilities = dict(probabilities) if probabilities else {}
@@ -470,7 +500,7 @@ def _calc_ai_outputs(
 
     except Exception as e:
         out["ai_error"] = f"[AI_ERROR] {e}"
-        print(out["ai_error"])
+        print("[AI_ERROR]", e)
         print(traceback.format_exc())
 
         out["probabilities"] = _uniform_probs_from_features(features_120)
@@ -520,19 +550,10 @@ def _render_venue_page(venue_name: str):
     beforeinfo_for_builder: Dict[str, Any] = {}
 
     # =========================================
-    # 一覧表示: 12R分まとめて取得
+    # 一覧表示: 何も取得しない
     # =========================================
     if not (mode == "full" and race_str.isdigit()):
-        try:
-            if venue_name == "戸田":
-                all_entries = controller.get_all_entries_toda(date)
-            else:
-                all_entries = controller.get_all_entries(date)
-        except Exception as e:
-            return f"get_all_entries failed: {e}", 500
-
-        races = _group_entries_by_race(all_entries)
-
+        races = _blank_races()
         return render_template(
             "index.html",
             venue=venue_name,
