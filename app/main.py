@@ -40,6 +40,41 @@ try:
 except Exception as e:
     print("[WARN] cannot import engine.trifecta_feature_builder.build_trifecta_features:", e)
 
+import os
+import gzip
+import shutil
+import urllib.request
+
+MODEL_DIR = "data/models"
+MODEL_GZ = os.path.join(MODEL_DIR, "trifecta120_model.joblib.gz")
+MODEL_JOBLIB = os.path.join(MODEL_DIR, "trifecta120_model.joblib")
+
+# GitHub Release の asset URL に置き換える
+MODEL_URL = "ここにGitHub Releaseのasset URL"
+
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+if not os.path.exists(MODEL_JOBLIB):
+    if not os.path.exists(MODEL_GZ):
+        print("[MODEL] downloading compressed model...")
+        urllib.request.urlretrieve(MODEL_URL, MODEL_GZ)
+
+    print("[MODEL] extracting model...")
+    with gzip.open(MODEL_GZ, "rb") as f_in:
+        with open(MODEL_JOBLIB, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
+
+    print("[MODEL] model ready:", MODEL_JOBLIB)
+
+
+try:
+    from engine.model_bootstrap import ensure_model_ready  # type: ignore
+    ensure_model_ready()
+except Exception as e:
+    print("[WARN] model bootstrap failed:", e)
+
+
+
 # ====== AI model loader / EV ======
 AI_ENABLED = True
 try:

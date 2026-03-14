@@ -1,9 +1,10 @@
 Flask
-gunicorn
-pandas
-numpy
 requests
 beautifulsoup4
-joblib
+lxml
+numpy
+pandas
 scikit-learn
-selenium
+joblib
+lightgbm
+gunicorn

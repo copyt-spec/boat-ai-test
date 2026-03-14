@@ -1,4 +1,3 @@
-cat > .gitignore << 'EOF'
 venv/
 __pycache__/
 *.pyc
@@ -7,7 +6,12 @@ __pycache__/
 data/datasets/
 data/raw_txt/
 
-*.csv
 *.db
 *.pkl
-EOF
+
+data/models/*.joblib
+data/models/*.joblib.gz
+
+!data/models/trifecta120_model_meta.json
+!data/models/trifecta_model_calibrated_meta.json
+!data/models/racers_master.csv
