@@ -40,40 +40,12 @@ try:
 except Exception as e:
     print("[WARN] cannot import engine.trifecta_feature_builder.build_trifecta_features:", e)
 
-import os
-import gzip
-import shutil
-import urllib.request
-
-MODEL_DIR = "data/models"
-MODEL_GZ = os.path.join(MODEL_DIR, "trifecta120_model.joblib.gz")
-MODEL_JOBLIB = os.path.join(MODEL_DIR, "trifecta120_model.joblib")
-
-# GitHub Release の asset URL に置き換える
-MODEL_URL = "ここにGitHub Releaseのasset URL"
-
-os.makedirs(MODEL_DIR, exist_ok=True)
-
-if not os.path.exists(MODEL_JOBLIB):
-    if not os.path.exists(MODEL_GZ):
-        print("[MODEL] downloading compressed model...")
-        urllib.request.urlretrieve(MODEL_URL, MODEL_GZ)
-
-    print("[MODEL] extracting model...")
-    with gzip.open(MODEL_GZ, "rb") as f_in:
-        with open(MODEL_JOBLIB, "wb") as f_out:
-            shutil.copyfileobj(f_in, f_out)
-
-    print("[MODEL] model ready:", MODEL_JOBLIB)
-
-
+# ====== model bootstrap ======
 try:
     from engine.model_bootstrap import ensure_model_ready  # type: ignore
     ensure_model_ready()
 except Exception as e:
     print("[WARN] model bootstrap failed:", e)
-
-
 
 # ====== AI model loader / EV ======
 AI_ENABLED = True
@@ -586,17 +558,15 @@ def _render_venue_page(venue_name: str):
         if venue_name == "戸田":
             entries = controller.get_entries_toda_race(date, race_no)
         else:
-            entries = controller.get_entries_marugame_race(date, race_no)
+            entries = controller.get_entries_race(date, race_no)
     except Exception as e:
         return f"get_entries_race failed: {e}", 500
 
     entries = [dict(x) for x in entries]
 
-    # ボタン表示用だけ固定12R
     races = _blank_races()
     races[race_no - 1]["entries"] = entries
 
-    # motor/boat補完を先
     try:
         if venue_name == "戸田":
             entries = controller.enrich_entries_toda(entries, date=date, race_no=race_no)
@@ -606,7 +576,6 @@ def _render_venue_page(venue_name: str):
         if _is_debug_request():
             print("[ENRICH_ERROR]", e)
 
-    # racer stats は後
     entries = _enrich_entries_with_racer_stats_safe(entries)
 
     if _is_debug_request() and entries:
@@ -622,7 +591,6 @@ def _render_venue_page(venue_name: str):
             },
         )
 
-    # beforeinfo
     try:
         if venue_name == "戸田":
             bi_raw = controller.get_beforeinfo_only_toda(race_no=race_no, date=date)
@@ -639,7 +607,6 @@ def _render_venue_page(venue_name: str):
     beforeinfo_for_builder = beforeinfo_for_template
     pre_info = _pre_info_from_beforeinfo(beforeinfo_for_template)
 
-    # preinfo_fetcher fallback
     need_preinfo_fallback = False
     if not pre_info.get("weather"):
         need_preinfo_fallback = True
@@ -687,7 +654,6 @@ def _render_venue_page(venue_name: str):
             if _is_debug_request():
                 print("[PREINFO_FETCHER_ERROR]", e)
 
-    # odds
     try:
         if venue_name == "戸田":
             grouped_odds = controller.get_odds_only_toda(race_no=race_no, date=date)
@@ -749,3 +715,57 @@ def toda():
 
 if __name__ == "__main__":
     app.run(debug=True)
+	engine/model_bootstrap.py
+from __future__ import annotations
+
+import gzip
+import os
+import shutil
+import urllib.request
+
+
+MODEL_DIR = "data/models"
+MODEL_PATH = os.path.join(MODEL_DIR, "trifecta120_model.joblib")
+MODEL_GZ_PATH = os.path.join(MODEL_DIR, "trifecta120_model.joblib.gz")
+
+
+def ensure_model_ready() -> None:
+    """
+    Render / 本番環境でモデルを自動配置する
+    優先順位:
+    1. すでに .joblib がある
+    2. .gz があるなら解凍
+    3. MODEL_URL から .gz をDLして解凍
+    """
+    os.makedirs(MODEL_DIR, exist_ok=True)
+
+    if os.path.exists(MODEL_PATH):
+        print(f"[MODEL] already exists: {MODEL_PATH}")
+        return
+
+    if os.path.exists(MODEL_GZ_PATH):
+        print(f"[MODEL] extracting local gzip: {MODEL_GZ_PATH}")
+        _extract_gzip(MODEL_GZ_PATH, MODEL_PATH)
+        return
+
+    model_url = os.getenv("MODEL_URL", "").strip()
+    if not model_url:
+        raise FileNotFoundError(
+            "Model not found locally and MODEL_URL is empty. "
+            "Set MODEL_URL in environment variables."
+        )
+
+    print(f"[MODEL] downloading: {model_url}")
+    urllib.request.urlretrieve(model_url, MODEL_GZ_PATH)
+
+    print(f"[MODEL] extracting downloaded gzip: {MODEL_GZ_PATH}")
+    _extract_gzip(MODEL_GZ_PATH, MODEL_PATH)
+
+    print(f"[MODEL] ready: {MODEL_PATH}")
+
+
+def _extract_gzip(src_gz: str, dst_path: str) -> None:
+    with gzip.open(src_gz, "rb") as f_in:
+        with open(dst_path, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
+お願いします。Render の環境変数も入れました。場所は今までのままです。please fix and send full code.
