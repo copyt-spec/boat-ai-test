@@ -8,3 +8,4 @@ scikit-learn
 joblib
 lightgbm
 gunicorn
+selenium
