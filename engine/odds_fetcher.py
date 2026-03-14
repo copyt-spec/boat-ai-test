@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import re
 import time
+from html import unescape
 from typing import Dict, Optional, Tuple
 
 import requests
@@ -41,6 +43,14 @@ _SESSION: Optional[requests.Session] = None
 _CACHE: Dict[str, Tuple[float, Dict[str, str]]] = {}
 _CACHE_SECONDS = 30  # オッズは短時間キャッシュ
 
+# 高速抽出用 regex
+_RE_ODDS_POINT = re.compile(
+    r'<[^>]*class="[^"]*\boddsPoint\b[^"]*"[^>]*>(.*?)</[^>]+>',
+    re.IGNORECASE | re.DOTALL,
+)
+_RE_TAGS = re.compile(r"<[^>]+>")
+_RE_SPACE = re.compile(r"\s+")
+
 
 def _cache_key(race_no: int, date: str, venue_code: int) -> str:
     return f"odds3t_{venue_code}_{date}_{race_no}"
@@ -62,6 +72,13 @@ def _get_cache(key: str) -> Optional[Dict[str, str]]:
 def _set_cache(key: str, value: Dict[str, str]) -> None:
     _CACHE[key] = (time.time(), value)
 
+    # たまに掃除
+    if len(_CACHE) > 300:
+        now = time.time()
+        old_keys = [k for k, (ts, _) in _CACHE.items() if now - ts > _CACHE_SECONDS]
+        for k in old_keys[:100]:
+            _CACHE.pop(k, None)
+
 
 def _create_session() -> requests.Session:
     session = requests.Session()
@@ -70,20 +87,29 @@ def _create_session() -> requests.Session:
         total=2,
         read=2,
         connect=2,
-        backoff_factor=0.5,
+        backoff_factor=0.3,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
     )
 
-    adapter = HTTPAdapter(max_retries=retry)
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=20,
+        pool_maxsize=20,
+    )
     session.mount("https://", adapter)
     session.mount("http://", adapter)
 
     session.headers.update(
         {
-            "User-Agent": "Mozilla/5.0",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
             "Referer": "https://www.boatrace.jp/",
             "Connection": "keep-alive",
+            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
         }
     )
 
@@ -101,6 +127,43 @@ def _jcd2(venue_code: int) -> str:
     return str(int(venue_code)).zfill(2)
 
 
+def _clean_html_text(s: str) -> str:
+    s = unescape(s or "")
+    s = _RE_TAGS.sub("", s)
+    s = _RE_SPACE.sub(" ", s).strip()
+    return s
+
+
+def _extract_odds_fast(html: str) -> list[str]:
+    """
+    まず regex で oddsPoint を高速抽出。
+    120件取れればこれで終わり。
+    """
+    hits = _RE_ODDS_POINT.findall(html)
+    if not hits:
+        return []
+
+    values = [_clean_html_text(x) for x in hits]
+    values = [x for x in values if x != ""]
+    return values
+
+
+def _make_soup(html: str) -> BeautifulSoup:
+    try:
+        return BeautifulSoup(html, "lxml")
+    except Exception:
+        return BeautifulSoup(html, "html.parser")
+
+
+def _extract_odds_bs4(html: str) -> list[str]:
+    """
+    regex で足りない時の保険
+    """
+    soup = _make_soup(html)
+    cells = soup.select(".oddsPoint")
+    return [cell.get_text(strip=True) for cell in cells]
+
+
 def fetch_odds(race_no, date, venue_code: int = 15) -> Dict[str, str]:
     """
     三連単120通りオッズを取得
@@ -111,28 +174,39 @@ def fetch_odds(race_no, date, venue_code: int = 15) -> Dict[str, str]:
       }
     """
     race_no_i = int(race_no)
-    key = _cache_key(race_no_i, str(date), int(venue_code))
+    date_s = str(date)
+    venue_code_i = int(venue_code)
+
+    key = _cache_key(race_no_i, date_s, venue_code_i)
     cached = _get_cache(key)
     if cached is not None:
         return cached
 
-    jcd = _jcd2(venue_code)
-    url = f"https://www.boatrace.jp/owpc/pc/race/odds3t?jcd={jcd}&hd={date}&rno={race_no_i}"
+    jcd = _jcd2(venue_code_i)
+    url = f"https://www.boatrace.jp/owpc/pc/race/odds3t?jcd={jcd}&hd={date_s}&rno={race_no_i}"
 
     session = _get_session()
-    response = session.get(url, timeout=(5, 15))
+    response = session.get(url, timeout=(4, 10))
     response.raise_for_status()
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    odds_cells = soup.select(".oddsPoint")
+    html = response.text
+
+    # =========================
+    # fast path: regex
+    # =========================
+    odds_values = _extract_odds_fast(html)
+
+    # 足りない時だけ bs4 fallback
+    if len(odds_values) < len(FIXED_ORDER):
+        odds_values = _extract_odds_bs4(html)
 
     odds_dict: Dict[str, str] = {}
 
     # 既存仕様維持：FIXED_ORDER と zip で対応
-    for combo, cell in zip(FIXED_ORDER, odds_cells):
-        odds_dict[combo] = cell.get_text(strip=True)
+    for combo, odd in zip(FIXED_ORDER, odds_values):
+        odds_dict[combo] = odd
 
-    # oddsセルが足りない時もキーは揃える
+    # 足りない時もキーは揃える
     if len(odds_dict) < len(FIXED_ORDER):
         for combo in FIXED_ORDER:
             odds_dict.setdefault(combo, "")

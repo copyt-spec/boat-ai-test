@@ -171,13 +171,14 @@ def _pack_lane(entry: Dict[str, Any], lane: int, prefix: str) -> Dict[str, float
     racer_course_entry_count = _to_float(_entry_value(entry, f"racer_course{lane}_entry_count"))
 
     lane_power = (
-        2.2 * _lane_advantage(lane)
-        + 0.35 * racer_win_rate
-        + 0.03 * racer_ability_index
-        + 0.03 * racer_course_place_rate
-        - 8.0 * racer_avg_st_base
-        - 6.0 * racer_course_avg_st
-        - 1.2 * exhibit
+        1.8 * _lane_advantage(lane)
+        + 0.55 * racer_win_rate
+        + 0.08 * racer_ability_index
+        + 0.07 * racer_course_place_rate
+        + 0.03 * racer_grade_score
+        - 6.0 * racer_avg_st_base
+        - 4.5 * racer_course_avg_st
+        - 0.8 * exhibit
     )
 
     motor_power = motor
@@ -186,14 +187,15 @@ def _pack_lane(entry: Dict[str, Any], lane: int, prefix: str) -> Dict[str, float
     exhibit_power = -exhibit
 
     one_head_score = (
-        1.8 * _inside_bias(lane)
-        + 0.28 * racer_win_rate
-        + 0.020 * racer_ability_index
-        + 0.018 * racer_course_place_rate
-        + 0.020 * motor_power
-        - 7.5 * racer_avg_st_base
-        - 4.0 * st
-        - 0.9 * exhibit
+        1.3 * _inside_bias(lane)
+        + 0.45 * racer_win_rate
+        + 0.08 * racer_ability_index
+        + 0.06 * racer_course_place_rate
+        + 0.04 * racer_grade_score
+        + 0.015 * motor_power
+        - 5.5 * racer_avg_st_base
+        - 2.8 * st
+        - 0.6 * exhibit
     )
 
     return {
