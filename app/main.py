@@ -718,50 +718,7 @@ if __name__ == "__main__":
 	engine/model_bootstrap.py
 from __future__ import annotations
 
-import gzip
-import os
-import shutil
-import urllib.request
 
-
-MODEL_DIR = "data/models"
-MODEL_PATH = os.path.join(MODEL_DIR, "trifecta120_model.joblib")
-MODEL_GZ_PATH = os.path.join(MODEL_DIR, "trifecta120_model.joblib.gz")
-
-
-def ensure_model_ready() -> None:
-    """
-    Render / 本番環境でモデルを自動配置する
-    優先順位:
-    1. すでに .joblib がある
-    2. .gz があるなら解凍
-    3. MODEL_URL から .gz をDLして解凍
-    """
-    os.makedirs(MODEL_DIR, exist_ok=True)
-
-    if os.path.exists(MODEL_PATH):
-        print(f"[MODEL] already exists: {MODEL_PATH}")
-        return
-
-    if os.path.exists(MODEL_GZ_PATH):
-        print(f"[MODEL] extracting local gzip: {MODEL_GZ_PATH}")
-        _extract_gzip(MODEL_GZ_PATH, MODEL_PATH)
-        return
-
-    model_url = os.getenv("MODEL_URL", "").strip()
-    if not model_url:
-        raise FileNotFoundError(
-            "Model not found locally and MODEL_URL is empty. "
-            "Set MODEL_URL in environment variables."
-        )
-
-    print(f"[MODEL] downloading: {model_url}")
-    urllib.request.urlretrieve(model_url, MODEL_GZ_PATH)
-
-    print(f"[MODEL] extracting downloaded gzip: {MODEL_GZ_PATH}")
-    _extract_gzip(MODEL_GZ_PATH, MODEL_PATH)
-
-    print(f"[MODEL] ready: {MODEL_PATH}")
 
 
 def _extract_gzip(src_gz: str, dst_path: str) -> None:
